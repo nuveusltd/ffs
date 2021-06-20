@@ -1,4 +1,3 @@
-
 VERSION=1.0
 BUILD_NO=$(shell cat ./.buildno)
 BUILD=`git rev-parse HEAD`

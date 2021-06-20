@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	fsBlockSize = 4096
+	fsBlockSize = 32768 //4096
 )
 
 var (
@@ -287,7 +287,7 @@ func (fs *ffs) Open(path string, flags int) (int, uint64) {
 
 // Getattr gets file attributes.
 func (fs *ffs) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
-	fmt.Printf(nlib.BashFontColor_RED+"Getattr Called  %s \n"+nlib.BashFontColor_RESET, path)
+	//fmt.Printf(nlib.BashFontColor_RED+"Getattr Called  %s \n"+nlib.BashFontColor_RESET, path)
 	var rowid uint64
 	if path == "/" || path == "." || path == ".." {
 		stgo := syscall.Stat_t{}
@@ -373,6 +373,7 @@ func (fs *ffs) Write(path string, buff []byte, ofst int64, fh uint64) int {
 	bs := make([]byte, 10)
 	for i, folder := range fs.folders {
 		toWrite := nlib.Encrypt(buff[i*partsize:(i+1)*partsize], enckey)
+		//toWrite := buff[i*partsize : (i+1)*partsize]
 		binary.PutUvarint(bs, uint64(len(toWrite)))
 		toWrite = append(bs, toWrite...)
 		fs.appendFile(filepath.Join(folder, fmt.Sprintf("%s.dat%d", filename, i)), toWrite)

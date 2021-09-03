@@ -5,12 +5,14 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,13 +22,14 @@ import (
 )
 
 const (
-	fsBlockSize = 32768 //4096
+	fsBlockSize = 4 * 1024 // 4KB
 )
 
 var (
 	BuildNumber string
 	Version     string
 	enckey      []byte
+	openFiles   map[string]ffs_File
 )
 
 type ffs struct {
@@ -145,9 +148,9 @@ func (fs *ffs) readParts(filename string, ofset int) map[int][]byte {
 		currentBlock := 0
 		for {
 			f.Read(bsizebuff)
-			fmt.Printf("- %v", bsizebuff)
+			//fmt.Printf("- %v", bsizebuff)
 			bsize, _ = binary.Uvarint(bsizebuff)
-			fmt.Printf("- block %d\n", bsize)
+			//fmt.Printf("- block %d\n", bsize)
 			if currentBlock == int(blockIndex) {
 				blockforRead := make([]byte, bsize)
 				f.Read(blockforRead)
@@ -253,12 +256,16 @@ func (fs *ffs) Rename(oldpath string, newpath string) int {
 
 // Chmod changes the permission bits of a file.
 func (fs *ffs) Chmod(path string, mode uint32) int {
-	log.Printf("Chmod Called \n")
+	if val, ok := openFiles[path]; ok {
+		val.Mode = mode
+		openFiles[path] = val
+		return 0
+	}
+	log.Printf("Chmod Called %d \n", mode)
 	fs.DB.Exec("update items set mode=? where fullpath=?", mode, path)
 	return 0
 }
 
-/*
 // Chown changes the owner and group of a file.
 func (fs *ffs) Chown(path string, uid uint32, gid uint32) int {
 	log.Printf("Chown Called \n")
@@ -271,17 +278,18 @@ func (fs *ffs) Utimens(path string, tmsp []fuse.Timespec) int {
 	return 0
 }
 
-*/
 // Open opens a file.
 // The flags are a combination of the fuse.O_* constants.
 func (fs *ffs) Open(path string, flags int) (int, uint64) {
 	log.Printf(nlib.BashFontColor_GREEN+"Open Called %s FLAG: %d \n"+nlib.BashFontColor_RESET, path, flags)
 	var rowid uint64
-	err := fs.DB.QueryRow("select rowid from items where fullpath=?", path).Scan(&rowid)
+	var fsize uint64
+	err := fs.DB.QueryRow("select rowid,fsize from items where fullpath=?", path).Scan(&rowid, &fsize)
 	if err != nil {
-		fmt.Printf("err")
+		fmt.Printf("open err %s\n", path)
 		return -fuse.ENOENT, 0 //No such file or directory
 	}
+	openFiles[path] = ffs_File{ID: int64(rowid), Size: int64(fsize), Name: filepath.Base(path), Kind: 1}
 	return 0, rowid
 }
 
@@ -294,35 +302,59 @@ func (fs *ffs) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 		path := filepath.Join(fs.folders[0])
 		syscall.Lstat(path, &stgo)
 		copyFusestatFromGostat(stat, &stgo)
+	} else if strings.Contains(path, "/._") {
+		if _, ok := openFiles[strings.Replace(path, "/._", "/", -1)]; ok {
+			stat.Ino = uint64(0)
+			stat.Gid = fs.gid
+
+			stat.Mode = 33206 //fuse.S_IFREG | 0444
+			stat.Size = 0
+			stat.Blksize = 4096
+			stat.Blocks = 1
+
+			return 0
+		}
+
 	} else {
 		var fsize int64
 		var isFolder bool
 		if ^uint64(0) == fh {
 			err := fs.DB.QueryRow("select fsize,isFolder,rowid from items where fullpath=?", path).Scan(&fsize, &isFolder, &rowid)
 			if err != nil {
-				fmt.Printf("err")
+				fmt.Printf("get attr err1 %s\n", path)
 				return -fuse.ENOENT //No such file or directory
 			}
 		} else {
 			rowid = fh
 			err := fs.DB.QueryRow("select fsize,isFolder from items where rowid=?", fh).Scan(&fsize, &isFolder)
 			if err != nil {
-				fmt.Printf("err")
+				fmt.Printf("get attr err2\n")
 				return -fuse.ENOENT //No such file or directory
 			}
 		}
+		stgo := syscall.Stat_t{}
+		filename := fs.createFileName(rowid)
+		syscall.Lstat(filename, &stgo)
+		copyFusestatFromGostat(stat, &stgo)
+
 		stat.Ino = rowid
 		stat.Gid = fs.gid
 		stat.Uid = fs.uid
-		stat.Atim = fuse.NewTimespec(time.Now())
-		stat.Mtim = stat.Atim
+		//stat.Atim = fuse.NewTimespec(time.Now())
+		//stat.Mtim = stat.Atim
 		if isFolder {
 			stat.Mode = 16877
 		} else {
-			stat.Mode = 33206 //fuse.S_IFREG | 0444
+			if val, ok := openFiles[path]; ok {
+				stat.Mode = val.Mode
+				return 0
+			} else {
+				stat.Mode = 33206 //fuse.S_IFREG | 0444
+			}
+
 			stat.Size = fsize
 			stat.Blksize = 4096
-			stat.Blocks = 1
+			//stat.Blocks = 1
 		}
 	}
 	//fmt.Printf("%#v \n", stat)
@@ -331,12 +363,46 @@ func (fs *ffs) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 
 // Read reads data from a file.
 func (fs *ffs) Read(path string, buff []byte, ofst int64, fh uint64) int {
-	log.Printf(nlib.BashFontColor_YELLOW+"Read Called %s offset %d fh %d \n"+nlib.BashFontColor_RESET, path, ofst, fh)
+	//log.Printf(nlib.BashFontColor_YELLOW+"Read Called %s offset %d fh %d \n"+nlib.BashFontColor_RESET, path, ofst, fh)
+	/*
+		parts := fs.readParts(fs.createFileName(fh), int(ofst))
+		part1 := nlib.Decrypt(parts[1], enckey)
+		part2 := nlib.Decrypt(parts[2], enckey)
+		return copy(buff, append(part1, part2...))
+	*/ //REad Parted
+	file := openFiles[path]
+	//log.Printf("File size : %d fileData : %d", file.Size, len(file.Data))
+	if len(file.Data) < 1 {
+		log.Printf(nlib.BashFontColor_YELLOW+"Real Read  %s \n"+nlib.BashFontColor_RESET, path)
+		filename := fs.createFileName(fh)
+		for i, folder := range fs.folders {
+			fullpath := filepath.Join(folder, fmt.Sprintf("%s.dat%d", filename, i))
+			encBytes, err := ioutil.ReadFile(fullpath)
+			log.Printf("file read %s %d %v\n", fullpath, len(encBytes), err)
+			if err == nil {
+				openData := nlib.Decrypt(encBytes, enckey)
+				log.Printf("Decrypt ... openData : %d", len(openData))
+				file.Data = append(file.Data, openData...)
+				//log.Printf("file decrypted\n")
+			} else {
+				//checksum'a git
+				log.Printf("--- Hata var %s", err)
+			}
+			log.Printf("Reading ... File size : %d fileData : %d", file.Size, len(file.Data))
+		}
+		if int(file.Size) < len(file.Data) {
+			file.Data = file.Data[:file.Size]
+		}
+		openFiles[path] = file
+	}
+	lastbyte := int(ofst) + len(buff)
+	log.Printf("file read %s offset %d lastbyte %d\n", path, ofst, lastbyte)
+	log.Printf("File size : %d fileData : %d", file.Size, len(file.Data))
+	log.Printf("Len1 %d Len2 %d \n", len(buff), len(file.Data[ofst:lastbyte]))
 
-	parts := fs.readParts(fs.createFileName(fh), int(ofst))
-	part1 := nlib.Decrypt(parts[1], enckey)
-	part2 := nlib.Decrypt(parts[2], enckey)
-	return copy(buff, append(part1, part2...))
+	copied := copy(buff, file.Data[ofst:lastbyte])
+	log.Printf("file read %s offset %d lastbyte %d copied %d\n", path, ofst, lastbyte, copied)
+	return copied
 }
 
 // Truncate changes the size of a file.
@@ -344,7 +410,7 @@ func (fs *ffs) Truncate(path string, size int64, fh uint64) int {
 	log.Printf("Truncate Called %s, size:%d, rec:%d \n", path, size, fh)
 	_, err := fs.DB.Exec("update items set fsize=? where rowid=?", size, fh)
 	if err != nil {
-		fmt.Printf("err")
+		fmt.Printf("truncate err")
 	}
 	filename := fs.createFileName(fh)
 	fs.truncateFile(filename)
@@ -360,50 +426,62 @@ func (fs *ffs) Create(path string, flags int, mode uint32) (errc int, fh uint64)
 		log.Println(e)
 	}
 	fhi, _ := res.LastInsertId()
+	openFiles[path] = ffs_File{ID: fhi, Size: 0, Name: filepath.Base(path), Kind: 2, Mode: mode}
 	return 0, uint64(fhi)
 }
 
 // Write writes data to a file.
 func (fs *ffs) Write(path string, buff []byte, ofst int64, fh uint64) int {
-	//log.Printf(nlib.BashFontColor_YELLOW+"Write Called ofst:%d,bsize:%d  \n"+nlib.BashFontColor_RESET, ofst, len(buff))
-
-	size := float64(len(buff))
-	partsize := int(math.Ceil(size / float64(len(fs.folders))))
-	filename := fs.createFileName(fh)
-	bs := make([]byte, 10)
-	for i, folder := range fs.folders {
-		toWrite := nlib.Encrypt(buff[i*partsize:(i+1)*partsize], enckey)
-		//toWrite := buff[i*partsize : (i+1)*partsize]
-		binary.PutUvarint(bs, uint64(len(toWrite)))
-		toWrite = append(bs, toWrite...)
-		fs.appendFile(filepath.Join(folder, fmt.Sprintf("%s.dat%d", filename, i)), toWrite)
-	}
-
-	csum := make([]byte, partsize)
-
-	for i := 0; i < len(fs.folders); i++ {
-		if i == 0 {
-			csum = buff[i*partsize : (i+1)*partsize]
-		} else {
-			csum = nlib.XOR2Bytes(csum, buff[i*partsize:(i+1)*partsize])
-		}
-	}
-	binary.PutUvarint(bs, uint64(len(csum)))
-	toWrite := append(bs, csum...)
-	fs.appendFile(filepath.Join(fs.csFolder, fmt.Sprintf("%s.sum", filename)), toWrite)
-	fs.DB.Exec("update items set fsize=fsize+? where rowid=?", size, fh)
+	//log.Printf(nlib.BashFontColor_RED+"Write Called ofst:%d,bsize:%d  \n"+nlib.BashFontColor_RESET, ofst, len(buff))
+	file := openFiles[path]
+	file.Data = append(file.Data, buff...)
+	openFiles[path] = file
+	log.Printf(nlib.BashFontColor_RED+"Write Called ofst:%d,bsize:%d DataLen: %d  \n"+nlib.BashFontColor_RESET, ofst, len(buff), len(file.Data))
 	return len(buff)
 
 }
 
 // Flush flushes cached file data.
 func (fs *ffs) Flush(path string, fh uint64) int {
+	file := openFiles[path]
+	if file.Kind == 2 {
+		log.Printf(nlib.BashFontColor_YELLOW+"Real Write %s data:%d  \n"+nlib.BashFontColor_RESET, path, len(file.Data))
+		size := float64(len(file.Data))
+		partsize := int(math.Ceil(size / float64(len(fs.folders))))
+		filename := fs.createFileName(fh)
+		//bs := make([]byte, 10)
+		for i, folder := range fs.folders {
+			toWrite := nlib.Encrypt(file.Data[i*partsize:(i+1)*partsize], enckey)
+			//binary.PutUvarint(bs, uint64(len(toWrite)))
+			//toWrite = append(bs, toWrite...)
+			ioutil.WriteFile(filepath.Join(folder, fmt.Sprintf("%s.dat%d", filename, i)), toWrite, 0644)
+			//fs.appendFile(filepath.Join(folder, fmt.Sprintf("%s.dat%d", filename, i)), toWrite)
+		}
+
+		csum := make([]byte, partsize)
+
+		for i := 0; i < len(fs.folders); i++ {
+			if i == 0 {
+				csum = file.Data[i*partsize : (i+1)*partsize]
+			} else {
+				csum = nlib.XOR2Bytes(csum, file.Data[i*partsize:(i+1)*partsize])
+			}
+		}
+		//binary.PutUvarint(bs, uint64(len(csum)))
+		//toWrite := append(bs, csum...)
+		//fs.appendFile(filepath.Join(fs.csFolder, fmt.Sprintf("%s.sum", filename)), toWrite)
+		//fs.appendFile(filepath.Join(fs.csFolder, fmt.Sprintf("%s.sum", filename)), csum)
+		ioutil.WriteFile(filepath.Join(fs.csFolder, fmt.Sprintf("%s.sum", filename)), csum, 0644)
+		fs.DB.Exec("update items set fsize=fsize+? where rowid=?", size, fh)
+	}
+
 	log.Printf("Flush Called %s %d \n", path, fh)
 	return 0
 }
 
 // Release closes an open file.
 func (fs *ffs) Release(path string, fh uint64) int {
+	delete(openFiles, path)
 	log.Printf("Release Called \n")
 	return 0
 }
@@ -425,7 +503,7 @@ func (fs *ffs) Readdir(path string,
 	fill func(name string, stat *fuse.Stat_t, ofst int64) bool,
 	ofst int64,
 	fh uint64) int {
-	log.Printf("Readdir Called \n")
+	//log.Printf("Readdir Called \n")
 	fill(".", nil, 0)
 	fill("..", nil, 0)
 
@@ -439,13 +517,15 @@ func (fs *ffs) Readdir(path string,
 	defer rows.Close()
 	i := 0
 	for rows.Next() {
-		log.Print(".")
 		i++
 		var n string
 		rows.Scan(&n)
 		fill(n, nil, 0)
 	}
-	log.Printf(" %d items found\n", i)
+	/*for _, element := range openFiles {
+		fill("._"+element.Name, nil, 0)
+	}*/
+	//log.Printf(" %d items found\n", i)
 	return 0
 }
 
@@ -463,34 +543,59 @@ func (fs *ffs) Fsyncdir(path string, datasync bool, fh uint64) int {
 
 // Setxattr sets extended attributes.
 func (fs *ffs) Setxattr(path string, name string, value []byte, flags int) int {
-	log.Printf("Setxattr Called \n")
+	//log.Printf("Setxattr Called\n")
+	log.Printf("Setxattr Called path:%s name:%s value:%v flags:%d \n", path, name, value, flags)
+	_, e := fs.DB.Exec("INSERT OR REPLACE into items_ex(fullpath,name,value,flag) VALUES (?,?,?,?)", path, name, value, flags)
+	if e != nil {
+		log.Println(e)
+	}
 	return 0
 }
 
 // Getxattr gets extended attributes.
 func (fs *ffs) Getxattr(path string, name string) (int, []byte) {
-	log.Printf("Getxattr Called \n")
-	return 0, []byte("")
+	log.Printf("Getxattr Called path %s name %s \n", path, name)
+
+	var val []byte
+	e := fs.DB.QueryRow("select value from items_ex where fullpath=? AND name=? ", path, name).Scan(&val)
+	if e != nil {
+		log.Println(e)
+		return 1, val
+	}
+	return 0, val
 }
 
 // Removexattr removes extended attributes.
 func (fs *ffs) Removexattr(path string, name string) int {
-	log.Printf("Removexattr Called \n")
+	_, e := fs.DB.Exec("DELETE from items_ex WHERE fullpath=? AND name=? ", path, name)
+	if e != nil {
+		log.Println(e)
+	}
 	return 0
 }
 
 // Listxattr lists extended attributes.
 func (fs *ffs) Listxattr(path string, fill func(name string) bool) int {
 	log.Printf("Listxattr \n")
+	var rows *sql.Rows
+	rows, _ = fs.DB.Query("SELECT name FROM items_ex WHERE fullpath=?", path)
+	defer rows.Close()
+	for rows.Next() {
+		var n string
+		rows.Scan(&n)
+		fill(n)
+	}
 	return 0
 }
 
 //Creates Empty SQLiteDB
 func (fs *ffs) CreateDb() {
 	fs.DB, _ = sql.Open("sqlite3", filepath.Join(fs.folders[0], "/.mfs_db"))
-	fs.DB.Exec("CREATE TABLE IF NOT EXISTS items (parentid INTEGER,name TEXT, fsize INTEGER,isFolder bool,fullpath string,cdate datetime, mdate datetime,mode integer)")
+	fs.DB.Exec("CREATE TABLE IF NOT EXISTS items (parentid INTEGER,name TEXT, fsize INTEGER,isFolder bool,fullpath string,cdate datetime, mdate datetime,mode integer,UNIQUE(fullpath))")
+	fs.DB.Exec("CREATE TABLE IF NOT EXISTS items_ex (fullpath TEXT,name TEXT, value BLOB,flag integer,UNIQUE(fullpath,name))")
 	fs.DB.Exec("CREATE INDEX IF NOT EXISTS ix_items_parentid ON items(parentid)")
 	fs.DB.Exec("CREATE INDEX IF NOT EXISTS ix_items_fullpath ON items(fullpath)")
+	fs.DB.Exec("CREATE INDEX IF NOT EXISTS ix_items_ex_fullpath ON items_ex(fullpath)")
 }
 
 func init() {
@@ -504,6 +609,7 @@ func main() {
 	syscall.Unmount("/Users/fatih/tmp/testFolder/mp", 1)
 
 	fmt.Println(nlib.Decrypt(nlib.Encrypt([]byte("ffs FileSystem"), enckey), enckey))
+	openFiles = make(map[string]ffs_File)
 
 	var mountPoint string
 	var checksumdir string
@@ -513,6 +619,9 @@ func main() {
 	flag.StringVar(&checksumdir, "checksumdir", "", "CheckSum Store Folder")
 	flag.Var(&dataFolders, "source", "Data Store Folder")
 	flag.Parse()
+	if len(flag.CommandLine.Args()) < 1 {
+		usage()
+	}
 
 	if len(dataFolders) < 2 {
 		log.Fatal("You must enter minimum 2 sources")
@@ -539,5 +648,5 @@ func main() {
 	}
 
 	_host := fuse.NewFileSystemHost(&fs)
-	_host.Mount(mountPoint, []string{}) // []string{"-d"})
+	_host.Mount(mountPoint, []string{"-o", "defer_permissions", "-o", "noappledouble", "-o", "volname=ffs-" + filepath.Base(mountPoint)}) // []string{"-d"})
 }

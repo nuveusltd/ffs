@@ -555,7 +555,6 @@ func (fs *ffs) Setxattr(path string, name string, value []byte, flags int) int {
 // Getxattr gets extended attributes.
 func (fs *ffs) Getxattr(path string, name string) (int, []byte) {
 	log.Printf("Getxattr Called path %s name %s \n", path, name)
-
 	var val []byte
 	e := fs.DB.QueryRow("select value from items_ex where fullpath=? AND name=? ", path, name).Scan(&val)
 	if e != nil {
@@ -605,29 +604,32 @@ func init() {
 }
 
 func main() {
-	enckey = []byte(nlib.GetMD5Hash("--ffs2021.06.21MFS"))
-	syscall.Unmount("/Users/fatih/tmp/testFolder/mp", 1)
-
-	fmt.Println(nlib.Decrypt(nlib.Encrypt([]byte("ffs FileSystem"), enckey), enckey))
 	openFiles = make(map[string]ffs_File)
 
 	var mountPoint string
 	var checksumdir string
+	var password string
 	var dataFolders ffs_LocalFolder
 
 	flag.StringVar(&mountPoint, "mountpoint", "", "Mount Folder")
 	flag.StringVar(&checksumdir, "checksumdir", "", "CheckSum Store Folder")
-	flag.Var(&dataFolders, "source", "Data Store Folder")
+	flag.Var(&dataFolders, "source", "Multiple Data Store Folders --source X/X/ --source X/Y")
+	flag.StringVar(&password, "password", "--ffs2021.06.21MFS", "Password for encryption")
 	flag.Parse()
 	if len(flag.CommandLine.Args()) < 1 {
 		usage()
+		return
 	}
+	enckey = []byte(nlib.GetMD5Hash(password))
 
 	if len(dataFolders) < 2 {
 		log.Fatal("You must enter minimum 2 sources")
 	}
 	if len(mountPoint) < 1 {
 		log.Fatal("You must enter mountpoint")
+	}
+	if len(checksumdir) < 1 {
+		log.Fatal("You must enter checksumdir")
 	}
 
 	u, _ := user.Current()

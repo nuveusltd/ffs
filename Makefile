@@ -2,7 +2,7 @@ VERSION=1.0
 BUILD_NO=$(shell cat ./.buildno)
 BUILD=`git rev-parse HEAD`
 LDFLAGS=-ldflags "-X main.BuildNumber=$(BUILD_NO) -X main.Version=$(VERSION) -X main.BuildHash=$(BUILD)"
-XC_OS="linux darwin"
+XC_OS=" darwin"
 XC_ARCH="amd64"
 XC_PARALLEL="3"
 BIN="./bin"

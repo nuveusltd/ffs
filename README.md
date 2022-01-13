@@ -1,7 +1,5 @@
 # ffs
 
-Firstly sorry for my bad English. And this my first real open-source project.  
-
 I have a lot of folders that is stored different cloud drives like Dropbox, GoogleDrive.   
 And I have some storage space on them.  
 
